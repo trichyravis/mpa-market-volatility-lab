@@ -90,6 +90,24 @@ def explain(title, rows, note=None):
         st.html(card(body))
 
 
+IST = dt.timezone(dt.timedelta(hours=5, minutes=30))
+
+
+@st.cache_data(ttl=6 * 3600, show_spinner=False)
+def _stamp6(key):
+    return dt.datetime.now(IST)
+
+
+def provenance(source, freq, latest, retrieved, note=None):
+    lat = latest if isinstance(latest, str) else (latest.strftime("%d %b %Y") if latest is not None else "–")
+    txt = (f"<b>Source:</b> {source} &nbsp;·&nbsp; <b>Frequency:</b> {freq} &nbsp;·&nbsp; <b>Latest observation:</b> {lat}"
+           f" &nbsp;·&nbsp; <b>Retrieved:</b> {retrieved.strftime('%d %b %Y, %H:%M IST')}")
+    if note:
+        txt += f" &nbsp;·&nbsp; {note}"
+    st.html(f'<div style="border-left:3px solid {GOLD};background:rgba(17,34,64,.7);padding:7px 12px;margin:6px 0 10px;'
+            f'border-radius:6px;user-select:none;-webkit-user-select:none">{t(txt, LB, 13)}</div>')
+
+
 def fig_base(title, h=420):
     f = go.Figure()
     f.update_layout(title=dict(text=title, font=dict(color=TXT)), paper_bgcolor="rgba(0,0,0,0)",
@@ -281,6 +299,9 @@ else:
                          "1 month": chg(30), "1 year": chg(365),
                          "Volatility 1y (ann.)": log_returns(c[c.index >= c.index[-1] - pd.Timedelta(days=365)]).std() / 100 * np.sqrt(ann_factor(sym))})
         tb = pd.DataFrame(rows).set_index("Asset")
+        provenance("Yahoo Finance (closing prices, adjusted for splits and dividends)", "daily closes",
+                   max(PX[s_]["Close"].index[-1] for s_ in PX), _stamp6("px|" + "|".join(PX) + period),
+                   "latest dates differ by market (see the Date column); prices may be delayed — not a real-time feed")
         st.dataframe(tb.style.format({"Last": "{:,.2f}", "1 day": "{:+.2%}", "1 month": "{:+.2%}", "1 year": "{:+.2%}",
                                       "Volatility 1y (ann.)": "{:.1%}"}, na_rep="–"), width="stretch")
         a, b = st.columns([1, 3])
@@ -327,6 +348,7 @@ else:
         k = {"Daily": ann_factor(sym), "Weekly": 52, "Monthly": 12}[rfreq]
         from scipy import stats as sps
         jb = sps.jarque_bera(r)
+        provenance("Yahoo Finance closing prices → log returns", rfreq.lower(), r.index[-1], _stamp6("px|" + "|".join(PX) + period))
         kpis([("Observations", f"{len(r)}", f"{r.index[0].date()} → {r.index[-1].date()}"),
               ("Mean return (ann.)", f"{r.mean() * k:.2f}%", f"{r.mean():.3f}% per period"),
               ("Volatility (ann.)", f"{r.std() * np.sqrt(k):.2f}%", f"{r.std():.3f}% per period"),
@@ -507,16 +529,23 @@ else:
                                        "Annualised vol %": np.sqrt(fvar * k),
                                        "Cumulative vol to day h %": np.sqrt(np.cumsum(fvar))},
                                       index=pd.Index(range(1, int(hor) + 1), name="Day ahead"))
-                    f = fig_base("Volatility forecast (annualised %)", 300)
-                    f.add_scatter(x=ft.index, y=ft["Annualised vol %"], name="Forecast", line=dict(color=GOLD, width=3))
+                    f = fig_base("Volatility forecast — out-of-sample (annualised %)", 300)
+                    f.add_scatter(x=ft.index, y=ft["Annualised vol %"], name="Forecast (model output)", line=dict(color=GOLD, width=3, dash="dash"))
                     if lr_vol:
                         f.add_hline(y=lr_vol, line=dict(color=LB, dash="dot"), annotation_text="long-run", annotation_font_color=LB)
                     f.update_xaxes(title="Days ahead")
                     st.plotly_chart(f, width="stretch")
-                f = fig_base(f"{nm}: {model} conditional volatility vs 21-day rolling (annualised %)", 400)
-                f.add_scatter(x=cvol.index, y=cvol * np.sqrt(k), name=f"{model} σ_t", line=dict(color=GOLD, width=2))
-                f.add_scatter(x=r.index, y=r.rolling(21).std() * np.sqrt(k), name="Rolling 21-day", line=dict(color=LB, width=1))
+                f = fig_base(f"{nm}: fitted (in-sample) {model} volatility vs observed 21-day realised volatility (annualised %)", 400)
+                f.add_scatter(x=r.index, y=r.rolling(21).std() * np.sqrt(k), name="Observed: 21-day realised volatility", line=dict(color=LB, width=1))
+                f.add_scatter(x=cvol.index, y=cvol * np.sqrt(k), name=f"Fitted (in-sample): {model} σ_t", line=dict(color=GOLD, width=2))
                 st.plotly_chart(f, width="stretch")
+                st.html(card(t("WHAT IS DATA AND WHAT IS MODEL OUTPUT", GOLD, 11, 800, "letter-spacing:1px") + "<br>" +
+                             t(f"<b>Observed:</b> {res.nobs} daily log returns of {nm}, {r.index[0].date()} → {r.index[-1].date()}. "
+                               f"<b>Fitted (in-sample):</b> σ<sub>t</sub> estimated by maximum likelihood on those same returns. "
+                               f"<b>Forecast (out-of-sample):</b> the next {int(hor)} days. The forecast and the VaR assume the estimated "
+                               f"parameters stay constant, no structural break or jump, and {dist.lower()} errors; they are model "
+                               f"estimates with their own uncertainty, not observed data. Parameter estimates are as of {r.index[-1].date()}.",
+                               TXT, 14), border=GOLD))
                 eqs = {
                     "ARCH(1)": "σ²<sub>t</sub> = ω + α ε²<sub>t−1</sub>",
                     "GARCH(1,1)": "σ²<sub>t</sub> = ω + α ε²<sub>t−1</sub> + β σ²<sub>t−1</sub>",
