@@ -558,7 +558,7 @@ else:
                       ("Long-run volatility", f"{lr_vol:.1f}%" if lr_vol else "–", "annualised, √(ω ÷ (1 − persistence) × " + str(k) + ")"),
                       ("Volatility today → tomorrow", f"{cvol.iloc[-1] * np.sqrt(k):.1f}% → {s1 * np.sqrt(k):.1f}%", "annualised"),
                       ("1-day VaR / ES", f"{selected_var:.2f}% / {selected_es:.2f}%", f"{g_conf:.1%} confidence · {dist} errors")])
-                st.markdown("#### Conditional 1-day VaR and Expected Shortfall")
+                st.markdown("#### Parametric 1-day VaR and Expected Shortfall · conditional model forecast")
                 st.dataframe(risk_table.style.format({c: "{:,.3f}" for c in risk_table.columns}), width="stretch")
                 st.info(f"At {g_conf:.1%} confidence, model VaR is {selected_var:.3f}%: the model assigns {1-g_conf:.1%} probability to a worse daily log-return loss. ES / CVaR is {selected_es:.3f}%: the average loss within that worst tail. Approximate position amounts are {g_value*selected_var/100:,.2f} and {g_value*selected_es/100:,.2f}, respectively.")
                 st.caption("ES (Expected Shortfall) is also called CVaR (Conditional Value at Risk). Here 'conditional' GARCH risk also means the forecast uses information available at the last observation. No square-root-of-time VaR/ES extrapolation is applied to the multi-day volatility chart.")
@@ -625,7 +625,7 @@ else:
                      f"ν = {nu:.1f}" if nu is not None else None,
                      "Fat tails beyond what volatility clustering explains. ν below about 10 = clearly fat-tailed. "
                      "Compare AIC/BIC with normal errors: lower is better."),
-                    ("1-day VaR and Conditional VaR", "VaR = −(μ + σ × q); ES = −(μ + σ × E[z | z ≤ q]), q = F⁻¹(1 − confidence)",
+                    ("1-day VaR and Conditional VaR", "Return cutoff = μ + σq; loss VaR = −(μ + σq); loss ES = −(μ + σ E[z | z ≤ q]); q = F⁻¹(1 − confidence)",
                      f"Confidence {g_conf:.1%}, mean {mu:.3f}%, next-day σ {s1:.3f}% → VaR {selected_var:.3f}%, ES {selected_es:.3f}%",
                      "VaR is the loss threshold; ES / CVaR averages the worse tail. Student t shocks are standardised to unit variance, consistent with the fitted arch model. Monetary values are linear approximations for a long position."),
                 ], note="Returns are daily log returns in %, so ω is in %² per day. Estimated with the Python 'arch' package (maximum likelihood).")
@@ -710,7 +710,7 @@ else:
             nvar, nes = tail_risk(float(rr.mean()), float(rr.std(ddof=1)), risk_conf)
             risk_summary = pd.DataFrame([
                 ["Historical simulation", hvar, hes, risk_value*hvar/100, risk_value*hes/100],
-                ["Normal (constant volatility)", nvar, nes, risk_value*nvar/100, risk_value*nes/100],
+                ["Parametric Normal (constant volatility)", nvar, nes, risk_value*nvar/100, risk_value*nes/100],
             ], columns=["Method", "1-day VaR loss %", "1-day ES / CVaR loss %", "VaR amount (approx.)", "ES amount (approx.)"]).set_index("Method")
             kpis([("Confidence", f"{risk_conf:.1%}", "one daily observation"),
                   ("Historical VaR", f"{hvar:.3f}%", f"worst-tail probability {1-risk_conf:.1%}"),
@@ -726,15 +726,28 @@ else:
             f.update_xaxes(title="Loss in daily log-return % (negative = gain)")
             st.plotly_chart(f, width="stretch")
             st.info("VaR answers: what loss threshold is exceeded with the chosen tail probability? ES / CVaR answers: how large is the average loss in that worst tail? Neither is a maximum possible loss.")
-            with st.expander("Formulas, units and assumptions"):
-                st.latex(r"VaR_c=-\mu+\sigma\Phi^{-1}(c),\qquad ES_c=-\mu+\sigma\frac{\phi(\Phi^{-1}(c))}{1-c}")
+            with st.expander("Parametric VaR: return threshold vs loss convention", expanded=True):
+                st.markdown("**Parametric Normal VaR — distinguish returns from losses.** Let daily return R be Normal with mean μ and standard deviation σ. Let c be confidence and z_c = Φ⁻¹(c), a positive Z-value at the confidence levels used here.")
+                st.latex(r"q_{1-c}(R)=\mu-\sigma z_c,\qquad z_c=\Phi^{-1}(c)>0")
+                st.markdown("**Lower-tail return threshold:** μ − σz_c. This is usually a negative return. If using the negative lower-tail Z-value z_(1−c), write the same threshold as μ + σz_(1−c).")
+                st.latex(r"VaR_c^{loss}=-q_{1-c}(R)=-\mu+\sigma z_c")
+                st.markdown("**VaR expressed as a loss:** reverse the sign of the return threshold. The table reports this loss convention, not the signed return cutoff.")
+                st.latex(r"\overline{R}_{tail}=\mu-\sigma\frac{\phi(z_c)}{1-c},\qquad ES_c^{loss}=-\overline{R}_{tail}=-\mu+\sigma\frac{\phi(z_c)}{1-c}")
+                st.markdown("**ES / CVaR:** the average worst-tail loss. These Normal formulas use return mean μ; if starting from a loss distribution instead, its mean is μ_L = −μ_R and VaR = μ_L + σ_L z_c.")
+                from scipy.stats import norm
+                z_work = float(norm.ppf(risk_conf))
+                tail_return = float(rr.mean()) - float(rr.std(ddof=1)) * norm.pdf(z_work) / (1-risk_conf)
+                st.markdown(f"**Worked example using {risk_asset}:** confidence **{risk_conf:.1%}**, daily mean **{rr.mean():.4f}%**, daily σ **{rr.std(ddof=1):.4f}%**, positive Z **{z_work:.4f}**. Return threshold = **{-nvar:.4f}%**; loss VaR = **{nvar:.4f}%**. Average worst-tail return = **{tail_return:.4f}%**; loss ES = **{nes:.4f}%**.")
+                convention = pd.DataFrame({"Measure": ["Lower-tail return threshold", "VaR expressed as loss", "Average worst-tail return", "ES / CVaR expressed as loss"], "Daily log-return / loss %": [-nvar, nvar, -nes, nes]})
+                st.dataframe(convention.style.format({"Daily log-return / loss %": "{:+.4f}"}), hide_index=True, width="stretch")
+                st.caption("The closed-form Φ/φ formulas apply to the Normal parametric method. Historical simulation uses empirical quantiles; the GARCH panel uses its selected Normal or unit-variance Student t distribution.")
                 st.markdown("Normal estimates use the sample daily mean and standard deviation. Historical VaR uses the empirical inverse CDF; historical ES averages exactly the worst (1 − confidence) fraction, with a fractional boundary observation where needed. Estimates can be negative if even the selected tail corresponds to a gain; values are not floored at zero.")
                 st.markdown("Returns are log returns in percent. Loss amounts equal position value × loss % ÷ 100: a linear approximation, not exact compounded P&L. Amounts use the position's own currency without FX conversion. One observation means one trading day for exchange assets and one calendar day for daily crypto. These estimates concern a long, linear exposure; options and short positions require separate payoff modelling.")
                 st.markdown("Historical and constant-volatility estimates describe the sample. For forward-looking, time-varying risk use the confidence selector and ES table in ARCH / GARCH lab. No multi-day square-root scaling is applied.")
             meta = pd.DataFrame({"Value": [risk_asset, str(risk_conf), str(risk_value), str(len(rr)), str(rr.index[0].date()), str(rr.index[-1].date()), "One observation; daily log-return losses; monetary linear approximation"]}, index=["Asset", "Confidence", "Position value", "Sample size", "Start", "End", "Horizon and units"])
             a, b = st.columns(2)
             a.download_button("Download VaR / ES CSV", risk_summary.to_csv().encode(), "VaR_Expected_Shortfall.csv", "text/csv", key="risk_csv", width="stretch")
-            b.download_button("Download VaR / ES Excel", to_excel({"VaR and ES": risk_summary, "Daily log returns": rr.to_frame("Log return %"), "Assumptions": meta}), "VaR_Expected_Shortfall.xlsx", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", key="risk_excel", width="stretch")
+            b.download_button("Download VaR / ES Excel", to_excel({"VaR and ES": risk_summary, "Normal sign convention": convention, "Daily log returns": rr.to_frame("Log return %"), "Assumptions": meta}), "VaR_Expected_Shortfall.xlsx", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", key="risk_excel", width="stretch")
 
 # ---------------- footer ----------------
 st.html(f"""<div style="margin-top:28px;padding:16px 10px;border-top:2px solid {GOLD};text-align:center;user-select:none;-webkit-user-select:none">
