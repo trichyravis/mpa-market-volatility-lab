@@ -231,6 +231,40 @@ def log_returns(close):
     return (np.log(close / close.shift(1)) * 100).dropna()  # in %
 
 
+# ---------------- loss-tail risk helpers ----------------
+def tail_risk(mean_pct, sigma_pct, confidence, distribution="Normal", nu=None):
+    """One-period VaR and ES in log-return percentage loss units; untruncated."""
+    from scipy.stats import norm, t as student_t
+    if not 0 < confidence < 1 or not np.isfinite(sigma_pct) or sigma_pct < 0:
+        raise ValueError("Confidence must be between 0 and 1 and volatility nonnegative.")
+    alpha = 1 - confidence
+    if distribution == "Student t":
+        if nu is None or not np.isfinite(nu) or nu <= 2:
+            raise ValueError("Standardised Student t requires degrees of freedom above 2.")
+        scale = np.sqrt((nu - 2) / nu)
+        tq = student_t.ppf(alpha, nu)
+        q = scale * tq
+        tail_mean = -scale * (nu + tq * tq) / (nu - 1) * student_t.pdf(tq, nu) / alpha
+    else:
+        q = norm.ppf(alpha)
+        tail_mean = -norm.pdf(q) / alpha
+    return -(mean_pct + sigma_pct * q), -(mean_pct + sigma_pct * tail_mean)
+
+
+def empirical_tail_risk(returns_pct, confidence):
+    """Empirical inverse-CDF VaR and exact worst-tail ES with fractional boundary mass."""
+    losses = np.sort(-np.asarray(returns_pct, dtype=float))
+    losses = losses[np.isfinite(losses)]
+    if len(losses) < 2 or not 0 < confidence < 1:
+        raise ValueError("At least two finite observations and valid confidence are required.")
+    var = float(losses[max(0, int(np.ceil(confidence * len(losses))) - 1)])
+    worst = losses[::-1]
+    mass = (1 - confidence) * len(worst)
+    n = int(np.floor(mass)); fraction = mass - n
+    es = (worst[:n].sum() + (fraction * worst[n] if n < len(worst) else 0)) / mass
+    return var, float(es)
+
+
 # ---------------- header ----------------
 st.html(card(t("FREE DATA LAB · MBA · CFA · FRM", BLUE, 12, 800,
                f"background:{GOLD};-webkit-text-fill-color:{BLUE};padding:4px 10px;border-radius:5px;letter-spacing:1px") +
@@ -284,7 +318,7 @@ if not PX:
 else:
     names = {name(s): s for s in PX}
     CLOSE = pd.DataFrame({name(s): PX[s]["Close"] for s in PX})
-    tabs = st.tabs(["📈 Prices", "📊 Returns & tests", "🌊 Volatility", "🧮 ARCH / GARCH lab", "🔗 Correlation"])
+    tabs = st.tabs(["📈 Prices", "📊 Returns & tests", "🌊 Volatility", "🧮 ARCH / GARCH lab", "🔗 Correlation", "🛡️ VaR & Expected Shortfall"])
 
     # ---------------- prices ----------------
     with tabs[0]:
@@ -464,6 +498,10 @@ else:
         a, b = st.columns(2)
         yrs = a.slider("Estimation window (years, most recent)", 1, 20, 5, key="g_yrs")
         meanm = b.radio("Mean equation", ["Constant", "Zero"], horizontal=True, key="g_mean")
+        rc1, rc2 = st.columns(2)
+        g_conf = rc1.number_input("VaR / ES confidence level (%)", min_value=90.0, max_value=99.9, value=99.0, step=0.5, format="%.1f", key="g_conf") / 100
+        g_value = rc2.number_input("Long position value (amount in chosen currency)", min_value=1.0, value=1000000.0, step=10000.0, key="g_position")
+        st.caption("Risk horizon: one observation (one trading day for exchange assets, one calendar day for daily crypto). Monetary losses use a linear log-return approximation in the position's own currency; no FX conversion.")
         sym = names[nm]
         k = ann_factor(sym)
         r = log_returns(PX[sym]["Close"])
@@ -508,14 +546,22 @@ else:
                 cvol = res.conditional_volatility
                 s1 = np.sqrt(fvar[0])
                 nu = P.get("nu")
-                q01 = res.model.distribution.ppf(0.01, [nu] if nu is not None else None)
-                q05 = res.model.distribution.ppf(0.05, [nu] if nu is not None else None)
-                var99, var95 = -(mu + s1 * float(np.atleast_1d(q01)[0])), -(mu + s1 * float(np.atleast_1d(q05)[0]))
+                selected_var, selected_es = tail_risk(mu, s1, g_conf, dist, nu)
+                risk_rows = []
+                for conf in sorted(set([.90, .95, .975, .99, .995, .999, float(g_conf)])):
+                    v_, e_ = tail_risk(mu, s1, conf, dist, nu)
+                    risk_rows.append({"Confidence %": conf * 100, "1-day VaR loss %": v_, "1-day ES loss %": e_,
+                                      "VaR amount (approx.)": g_value * v_ / 100, "ES amount (approx.)": g_value * e_ / 100})
+                risk_table = pd.DataFrame(risk_rows).set_index("Confidence %")
                 kpis([("Persistence", f"{pers:.4f}", "α + β" if model == "GARCH(1,1)" else ("α + β + γ/2" if "GJR" in model else ("β" if "EGARCH" in model else "α"))),
                       ("Half-life of a shock", f"{half:.1f} days" if half else "–", "ln 0.5 ÷ ln(persistence)"),
                       ("Long-run volatility", f"{lr_vol:.1f}%" if lr_vol else "–", "annualised, √(ω ÷ (1 − persistence) × " + str(k) + ")"),
                       ("Volatility today → tomorrow", f"{cvol.iloc[-1] * np.sqrt(k):.1f}% → {s1 * np.sqrt(k):.1f}%", "annualised"),
-                      ("1-day VaR", f"{var99:.2f}% (99%) · {var95:.2f}% (95%)", f"{dist} errors")])
+                      ("1-day VaR / ES", f"{selected_var:.2f}% / {selected_es:.2f}%", f"{g_conf:.1%} confidence · {dist} errors")])
+                st.markdown("#### Conditional 1-day VaR and Expected Shortfall")
+                st.dataframe(risk_table.style.format({c: "{:,.3f}" for c in risk_table.columns}), width="stretch")
+                st.info(f"At {g_conf:.1%} confidence, model VaR is {selected_var:.3f}%: the model assigns {1-g_conf:.1%} probability to a worse daily log-return loss. ES / CVaR is {selected_es:.3f}%: the average loss within that worst tail. Approximate position amounts are {g_value*selected_var/100:,.2f} and {g_value*selected_es/100:,.2f}, respectively.")
+                st.caption("ES (Expected Shortfall) is also called CVaR (Conditional Value at Risk). Here 'conditional' GARCH risk also means the forecast uses information available at the last observation. No square-root-of-time VaR/ES extrapolation is applied to the multi-day volatility chart.")
                 pt = pd.DataFrame({"Estimate": P, "Std. error": res.std_err, "t-stat": res.tvalues, "p-value": res.pvalues})
                 a, b = st.columns([1, 1])
                 with a:
@@ -579,9 +625,9 @@ else:
                      f"ν = {nu:.1f}" if nu is not None else None,
                      "Fat tails beyond what volatility clustering explains. ν below about 10 = clearly fat-tailed. "
                      "Compare AIC/BIC with normal errors: lower is better."),
-                    ("1-day Value at Risk", "VaR<sub>99%</sub> = −(μ + σ<sub>t+1</sub> × q<sub>0.01</sub>)",
-                     f"−({mu:.3f} + {s1:.3f} × {float(np.atleast_1d(q01)[0]):.3f}) = {var99:.2f}% of position value",
-                     "q is the 1% quantile of the standardised error distribution (−2.33 for normal; further out for Student t)."),
+                    ("1-day VaR and Conditional VaR", "VaR = −(μ + σ × q); ES = −(μ + σ × E[z | z ≤ q]), q = F⁻¹(1 − confidence)",
+                     f"Confidence {g_conf:.1%}, mean {mu:.3f}%, next-day σ {s1:.3f}% → VaR {selected_var:.3f}%, ES {selected_es:.3f}%",
+                     "VaR is the loss threshold; ES / CVaR averages the worse tail. Student t shocks are standardised to unit variance, consistent with the fitted arch model. Monetary values are linear approximations for a long position."),
                 ], note="Returns are daily log returns in %, so ω is in %² per day. Estimated with the Python 'arch' package (maximum likelihood).")
                 st.markdown("#### Compare models")
                 if st.button("Fit all models (GARCH, GJR, EGARCH, ARCH × Normal, Student t)", key="g_all"):
@@ -609,7 +655,8 @@ else:
                     st.caption("Ranked by AIC (lower is better). BIC penalises extra parameters more heavily.")
                 cv = pd.DataFrame({"Log return %": r, "Conditional vol % (daily)": cvol,
                                    "Conditional vol % (annualised)": cvol * np.sqrt(k), "Standardised residual": res.std_resid})
-                xl = to_excel({"Parameters": pt, "Conditional volatility": cv, "Forecast": ft})
+                xl = to_excel({"Parameters": pt, "Conditional volatility": cv, "Forecast": ft, "VaR and Expected Shortfall": risk_table,
+                               "Risk assumptions": pd.DataFrame({"Value": [nm, model, dist, str(nu), str(g_conf), str(g_value), "One observation; daily log-return loss; monetary linear approximation"]}, index=["Asset", "Model", "Distribution", "Student t df", "Confidence", "Position value", "Horizon and units"])})
                 a, b = st.columns(2)
                 a.download_button("Download model results (Excel)", xl, f"{model}_{re.sub('[^A-Za-z0-9]+', '_', nm)}.xlsx",
                                   "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", width="stretch")
@@ -646,6 +693,49 @@ else:
                        "they often jump towards 1 in crises, just when diversification is needed most.")
             downloads(C, f"Correlation_{cfreq}", "corr")
 
+    # ---------------- standalone historical / normal VaR and ES ----------------
+    with tabs[5]:
+        st.markdown("### VaR & Conditional VaR (Expected Shortfall)")
+        a, b, c = st.columns(3)
+        risk_asset = a.selectbox("Risk asset", list(names), key="risk_asset")
+        risk_conf = b.number_input("Confidence level (%)", 90.0, 99.9, 99.0, .5, format="%.1f", key="risk_conf") / 100
+        risk_value = c.number_input("Long position value (own currency)", 1.0, value=1000000.0, step=10000.0, key="risk_value")
+        rr = log_returns(PX[names[risk_asset]]["Close"])
+        risk_years = st.slider("Risk estimation window (years)", 1, 20, 5, key="risk_years")
+        rr = rr[rr.index >= rr.index[-1] - pd.DateOffset(years=risk_years)]
+        if len(rr) < 30:
+            st.warning("Load at least 30 daily observations to estimate tail risk.")
+        else:
+            hvar, hes = empirical_tail_risk(rr, risk_conf)
+            nvar, nes = tail_risk(float(rr.mean()), float(rr.std(ddof=1)), risk_conf)
+            risk_summary = pd.DataFrame([
+                ["Historical simulation", hvar, hes, risk_value*hvar/100, risk_value*hes/100],
+                ["Normal (constant volatility)", nvar, nes, risk_value*nvar/100, risk_value*nes/100],
+            ], columns=["Method", "1-day VaR loss %", "1-day ES / CVaR loss %", "VaR amount (approx.)", "ES amount (approx.)"]).set_index("Method")
+            kpis([("Confidence", f"{risk_conf:.1%}", "one daily observation"),
+                  ("Historical VaR", f"{hvar:.3f}%", f"worst-tail probability {1-risk_conf:.1%}"),
+                  ("Historical ES / CVaR", f"{hes:.3f}%", "average worst-tail loss"),
+                  ("Tail sample size", f"{len(rr)*(1-risk_conf):.1f}", f"effective observations of {len(rr)}")])
+            st.dataframe(risk_summary.style.format("{:,.3f}"), width="stretch")
+            if len(rr)*(1-risk_conf) < 20:
+                st.warning("Fewer than 20 effective tail observations: historical ES is highly sensitive to the sample and confidence level.")
+            f = fig_base(f"{risk_asset}: observed daily log-return losses (%)", 400)
+            f.add_histogram(x=-rr, nbinsx=60, marker_color=LB, name="Observed losses")
+            f.add_vline(x=hvar, line_color=GOLD, line_dash="dash", annotation_text="Historical VaR", annotation_font_color=GOLD)
+            f.add_vline(x=hes, line_color=RED, line_dash="dot", annotation_text="Historical ES", annotation_font_color=RED)
+            f.update_xaxes(title="Loss in daily log-return % (negative = gain)")
+            st.plotly_chart(f, width="stretch")
+            st.info("VaR answers: what loss threshold is exceeded with the chosen tail probability? ES / CVaR answers: how large is the average loss in that worst tail? Neither is a maximum possible loss.")
+            with st.expander("Formulas, units and assumptions"):
+                st.latex(r"VaR_c=-\mu+\sigma\Phi^{-1}(c),\qquad ES_c=-\mu+\sigma\frac{\phi(\Phi^{-1}(c))}{1-c}")
+                st.markdown("Normal estimates use the sample daily mean and standard deviation. Historical VaR uses the empirical inverse CDF; historical ES averages exactly the worst (1 − confidence) fraction, with a fractional boundary observation where needed. Estimates can be negative if even the selected tail corresponds to a gain; values are not floored at zero.")
+                st.markdown("Returns are log returns in percent. Loss amounts equal position value × loss % ÷ 100: a linear approximation, not exact compounded P&L. Amounts use the position's own currency without FX conversion. One observation means one trading day for exchange assets and one calendar day for daily crypto. These estimates concern a long, linear exposure; options and short positions require separate payoff modelling.")
+                st.markdown("Historical and constant-volatility estimates describe the sample. For forward-looking, time-varying risk use the confidence selector and ES table in ARCH / GARCH lab. No multi-day square-root scaling is applied.")
+            meta = pd.DataFrame({"Value": [risk_asset, str(risk_conf), str(risk_value), str(len(rr)), str(rr.index[0].date()), str(rr.index[-1].date()), "One observation; daily log-return losses; monetary linear approximation"]}, index=["Asset", "Confidence", "Position value", "Sample size", "Start", "End", "Horizon and units"])
+            a, b = st.columns(2)
+            a.download_button("Download VaR / ES CSV", risk_summary.to_csv().encode(), "VaR_Expected_Shortfall.csv", "text/csv", key="risk_csv", width="stretch")
+            b.download_button("Download VaR / ES Excel", to_excel({"VaR and ES": risk_summary, "Daily log returns": rr.to_frame("Log return %"), "Assumptions": meta}), "VaR_Expected_Shortfall.xlsx", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", key="risk_excel", width="stretch")
+
 # ---------------- footer ----------------
 st.html(f"""<div style="margin-top:28px;padding:16px 10px;border-top:2px solid {GOLD};text-align:center;user-select:none;-webkit-user-select:none">
 {t("The Mountain Path Academy · Prof. V. Ravichandran", TXT, 14, 700)}<br>
@@ -653,3 +743,4 @@ st.html(f"""<div style="margin-top:28px;padding:16px 10px;border-top:2px solid {
 {t(" · ", MUTED)}<a href="https://www.linkedin.com/in/trichyravis" target="_blank" style="color:{GOLD};-webkit-text-fill-color:{GOLD};text-decoration:none;font-weight:700">LinkedIn</a>
 {t(" · ", MUTED)}<a href="https://github.com/trichyravis" target="_blank" style="color:{GOLD};-webkit-text-fill-color:{GOLD};text-decoration:none;font-weight:700">GitHub</a><br>
 {t("Data: Yahoo Finance. Education only — not investment advice.", MUTED, 12)}</div>""")
+
