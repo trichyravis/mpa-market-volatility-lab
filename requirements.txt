@@ -1,0 +1,11 @@
+streamlit>=1.40
+requests
+pandas
+numpy
+scipy
+plotly
+openpyxl
+yfinance>=0.2.60
+curl_cffi
+statsmodels
+arch
